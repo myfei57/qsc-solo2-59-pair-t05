@@ -16,7 +16,7 @@ from .balance.balance import Balancer
 from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
-from .errors import StoreError
+from .errors import InterlockError, StoreError
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
@@ -26,6 +26,7 @@ from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ops.charge import charge_rack
 from .ops.discharge import discharge_rack
+from .ops.isolate import isolate_racks
 from .ops.suppression import suppress
 from .ops.transfer import transfer_to_grid
 from .pcs.pcs import Pcs
@@ -39,6 +40,7 @@ from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
 from .telemetry import TrendBuffer
 from .quota.quota import QuotaLedger
+from .trace.service import TraceService
 
 DEFAULT_STATION = "station1"
 DEFAULT_RACK = "rk-01"
@@ -106,6 +108,9 @@ class Platform:
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
+        self.trace = TraceService(store.root, self.clock)
+        self._isolation_blocks: set[str] = set()
+        self._seed_trace_ledger()
 
         self._cycles = 0
         self._operations = 0
@@ -116,6 +121,7 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
+        self._restore_isolation_latches()
         self.bms.calibration.record(self.config.soc.initial_soc_pct, self.clock.now(), "startup")
 
     def _register_namespaces(self) -> None:
@@ -131,11 +137,21 @@ class Platform:
             ("station", "balance", "cell-balancer"),
             ("station", "quota", "quota-ledger"),
             ("station", "audit", "run-audit"),
+            ("station", "trace", "batch-traceability"),
         ):
             self.namespaces.register(area, device, kind)
         for rack_id, rack in self.racks.items():
             self.namespaces.register("rack", rack_id, "battery-cluster")
             self.namespaces.register(rack.zone, rack_id, "fire-zone-member")
+
+    def _seed_trace_ledger(self) -> None:
+        """把现役单体按簇登记进谱系台账：相邻簇交错两个出厂批次，重启补种幂等。"""
+
+        for index, rack_id in enumerate(sorted(self.racks)):
+            batch_id = f"lot-{(index % 2) + 1}"
+            for cell in self.racks[rack_id].cells():
+                self.trace.register_cell(cell.cell_id, batch_id)
+                self.trace.install_cell(cell.cell_id, rack_id)
 
     def _restore(self) -> None:
         """从落盘状态恢复平台计数，保证重启后计数连续。"""
@@ -148,6 +164,27 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
             self._drills = int(state.get("drills", 0))
+
+    def _restore_isolation_latches(self) -> None:
+        """重启后按战役状态重新咬合隔离闩锁：已隔离的簇不能因为重启恢复并网。"""
+
+        restored: list[str] = []
+        for campaign in self.trace.snapshot()["campaigns"]:
+            for rack_id, task in campaign["tasks"].items():
+                if task["state"] == "isolated" and rack_id in self.racks:
+                    self.bms.latch.engage(rack_id, "batch_isolation", self.clock.now())
+                    restored.append(rack_id)
+        if restored:
+            self.bus.publish(
+                Event.of(
+                    "trace",
+                    "trace",
+                    "isolation_restored",
+                    station=self.station,
+                    severity="warning",
+                    racks=len(restored),
+                )
+            )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -421,21 +458,38 @@ class Platform:
             summary = self._record_operation(op_id, "temperature", report)
             return {**report, **summary, "charge_limit_ratio": round(ratio, 4)}
 
-    def replace_pack_rating(self, pack_index: int = 0, rating_v: float = 3.35, rack_id: str | None = None) -> dict:
-        """更换整包电芯并立即刷新降额基线。"""
+    def _rotate_pack_cells(self, rack: Rack, pack_index: int, batch_id: str | None) -> dict:
+        """换包后重排谱系：旧单体离簇，新单体按到货批次登记进簇。"""
+
+        pack = rack.packs()[pack_index]
+        lot = batch_id or f"lot-{rack.rack_id}-e{rack.rating_epoch}"
+        rotated = 0
+        for index, cell in enumerate(pack.cells()):
+            old_id = cell.cell_id
+            self.trace.remove_cell(old_id, rack.rack_id)
+            cell.cell_id = f"{pack.pack_id}-e{rack.rating_epoch}c{index + 1}"
+            self.trace.register_cell(cell.cell_id, lot)
+            self.trace.install_cell(cell.cell_id, rack.rack_id)
+            rotated += 1
+        return {"pack_id": pack.pack_id, "batch_id": lot, "rotated": rotated}
+
+    def replace_pack_rating(self, pack_index: int = 0, rating_v: float = 3.35, rack_id: str | None = None, batch_id: str | None = None) -> dict:
+        """更换整包电芯并立即刷新降额基线，同时把新旧单体的谱系台账补齐。"""
 
         with self._lock:
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             change = rack.replace_pack_rating(pack_index, rating_v)
+            rotation = self._rotate_pack_cells(rack, pack_index, batch_id)
             baseline = self.temp.apply_temperature(rack.temperature_c(), self.clock.now(), rack.rating_v(), rack.rating_epoch)
             steps = [
                 {"component": "rack", "action": "replace_pack", "detail": change},
+                {"component": "trace", "action": "rotate_cells", "detail": rotation},
                 {"component": "temp", "action": "baseline_refresh", "detail": baseline},
             ]
             report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
             summary = self._record_operation(op_id, "replace_pack", report)
-            return {**report, **summary}
+            return {**report, **summary, "rotation": rotation}
 
     def calibrate_soc(self, soc_pct: float, source: str = "manual") -> dict:
         """登记一次 SOC 校准并按新基准重估。"""
@@ -552,6 +606,181 @@ class Platform:
                 "voltage_v": round(cell.voltage_v, 4),
                 "delta_mv": round(metrics.delta_mv, 2),
             }
+
+    def record_cell_move(self, cell_id: str, to_rack_id: str, batch_id: str | None = None) -> dict:
+        """登记一次跨簇调拨（检修记录入台账），新单体可同时补登批次。"""
+
+        with self._lock:
+            self._rack(to_rack_id)
+            movement = self.trace.move_cell(cell_id, to_rack_id, batch_id=batch_id)
+            self.bus.publish(
+                Event.of("trace", "trace", "cell_moved", station=self.station, severity="notice", **movement)
+            )
+            return movement
+
+    def trace_cell(self, cell_id: str, as_of: float | None = None) -> dict:
+        """从一只单体反查它属于哪个批次、进过哪些簇；``as_of`` 按时间点回放。"""
+
+        with self._lock:
+            report = self.trace.trace(cell_id, as_of=as_of)
+            self.bus.publish(
+                Event.of(
+                    "trace",
+                    "trace",
+                    "cell_traced",
+                    station=self.station,
+                    severity="notice",
+                    cell_id=cell_id,
+                    batch_id=report["batch_id"],
+                    racks=len(report["racks"]),
+                )
+            )
+            return report
+
+    def open_isolation(self, cell_id: str | None = None, cell_ids: list[str] | None = None, caliber: str = "batch") -> dict:
+        """开立批次隔离战役：从异常单体算口径范围，落成逐簇任务。
+
+        默认 ``batch`` 保守口径：批次性问题漏圈的代价是热失控，多圈的代价只是
+        停产面，两种损失不对称；``window`` 口径留作台账被验证完整后的收敛手段。
+        """
+
+        with self._lock:
+            op_id = self.ids.next()
+            seeds = list(cell_ids or []) or ([cell_id] if cell_id else [])
+            opened = self.trace.open_campaign(seeds, caliber)
+            scope = opened["scope"]
+            steps = [
+                {
+                    "component": "trace",
+                    "action": "trace_seed",
+                    "detail": {"seeds": len(scope["seed_cells"]), "batches": len(scope["batches"])},
+                },
+                {
+                    "component": "trace",
+                    "action": "compute_scope",
+                    "detail": {"caliber": scope["caliber"], "targets": len(scope["targets"])},
+                },
+            ]
+            report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
+            summary = self._record_operation(op_id, "open_isolation", report)
+            return {**opened, **report, **summary}
+
+    def recalculate_isolation(self, campaign_id: str, caliber: str | None = None) -> dict:
+        """按当前台账重算范围并单调合并：只加新簇，已隔离的簇不撤回。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            result = self.trace.recalculate(campaign_id, caliber=caliber)
+            steps = [
+                {
+                    "component": "trace",
+                    "action": "recalculate_scope",
+                    "detail": {
+                        "caliber": result["scope"]["caliber"],
+                        "targets": len(result["scope"]["targets"]),
+                        "added": len(result["merged"]["added"]),
+                    },
+                }
+            ]
+            report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
+            summary = self._record_operation(op_id, "recalculate_isolation", report)
+            return {**result, **report, **summary}
+
+    def _apply_isolation(self, rack_id: str) -> dict:
+        """隔离执行钩子：簇不可达时报错，否则咬合故障闩锁挡住就绪判据。"""
+
+        if rack_id in self._isolation_blocks:
+            raise InterlockError(f"簇 {rack_id} 通信不可达，隔离指令未确认", component="trace")
+        self._rack(rack_id)
+        engaged = self.bms.latch.engage(rack_id, "batch_isolation", self.clock.now())
+        self.bus.publish(
+            Event.of(
+                "trace",
+                "trace",
+                "rack_isolated",
+                station=self.station,
+                severity="warning",
+                rack_id=rack_id,
+                code="batch_isolation",
+                generation=engaged["generation"],
+            )
+        )
+        return engaged
+
+    def execute_isolation(self, campaign_id: str, rack_ids: list[str] | None = None) -> dict:
+        """并发下落隔离：每簇一条线程，失败的簇记原因留待续作。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            campaign = self.trace.campaign(campaign_id)
+            targets = list(rack_ids) if rack_ids else campaign.pending_or_failed()
+            report = isolate_racks(campaign, self._apply_isolation, targets, self.clock.now())
+            summary = self._record_operation(op_id, "execute_isolation", report)
+            return {**report, **summary}
+
+    def resume_isolation(self, campaign_id: str) -> dict:
+        """续作：只重跑待处理与失败的簇，已隔离的簇不重复下落。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            campaign = self.trace.campaign(campaign_id)
+            report = isolate_racks(campaign, self._apply_isolation, campaign.pending_or_failed(), self.clock.now())
+            summary = self._record_operation(op_id, "resume_isolation", report)
+            return {**report, **summary}
+
+    def block_isolation(self, rack_id: str, blocked: bool = True) -> dict:
+        """演练用：把某簇标记为隔离指令不可达，复现中途失败与续作。"""
+
+        with self._lock:
+            self._rack(rack_id)
+            if blocked:
+                self._isolation_blocks.add(rack_id)
+            else:
+                self._isolation_blocks.discard(rack_id)
+            self.bus.publish(
+                Event.of(
+                    "trace",
+                    "trace",
+                    "isolation_block",
+                    station=self.station,
+                    severity="notice",
+                    rack_id=rack_id,
+                    blocked=bool(blocked),
+                )
+            )
+            return {"rack_id": rack_id, "blocked": bool(blocked)}
+
+    def trace_replay(self, campaign_id: str, as_of: float) -> dict:
+        """按时间点回放：当时的台账会圈出哪些簇，与现在的范围差多少。"""
+
+        with self._lock:
+            replayed = self.trace.replay(campaign_id, as_of)
+            self.bus.publish(
+                Event.of(
+                    "trace",
+                    "trace",
+                    "scope_replayed",
+                    station=self.station,
+                    severity="notice",
+                    campaign_id=campaign_id,
+                    as_of=float(as_of),
+                )
+            )
+            return replayed
+
+    def isolation_snapshot(self, campaign_id: str | None = None) -> dict:
+        """隔离执行跟踪视图：指定战役或全部战役。"""
+
+        with self._lock:
+            if campaign_id is None:
+                return {"campaigns": self.trace.snapshot()["campaigns"]}
+            return self.trace.campaign(campaign_id).snapshot()
+
+    def trace_snapshot(self) -> dict:
+        """谱系台账与隔离战役总览。"""
+
+        with self._lock:
+            return self.trace.snapshot()
 
     def cycle(self, dt: float = 5.0) -> dict:
         """推进一个控制周期。"""
@@ -767,6 +996,7 @@ class Platform:
             "grid": self.grid_snapshot(),
             "soc": self.soc_snapshot(),
             "balance": self.balance_snapshot(),
+            "trace": self.trace_snapshot(),
         }
 
     def snapshot(self) -> dict:

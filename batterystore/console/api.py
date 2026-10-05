@@ -30,6 +30,16 @@ def _as_int(body: dict, key: str, default: int) -> int:
         raise StoreError(f"参数 {key!r} 必须是整数", component="console") from error
 
 
+def _as_optional_float(body: dict, key: str) -> float | None:
+    value = body.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as error:
+        raise StoreError(f"参数 {key!r} 必须是数值", component="console") from error
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -78,6 +88,11 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/config", lambda params, body: self._platform.config_export())
+        add("GET", "/api/trace", lambda params, body: self._platform.trace_snapshot())
+        add("GET", "/api/trace/{cell_id}", self._trace_cell)
+        add("GET", "/api/isolation", lambda params, body: self._platform.isolation_snapshot())
+        add("GET", "/api/isolation/{campaign_id}", self._isolation_detail)
+        add("GET", "/api/isolation/replay/{campaign_id}", self._isolation_replay)
         add("GET", "/api/pages", lambda params, body: {"pages": self._pages.index(), "routes": self.routes()})
         add("POST", "/api/start", lambda params, body: self._platform.start())
         add("POST", "/api/stop", lambda params, body: self._platform.stop())
@@ -100,6 +115,12 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("POST", "/api/cell/move", self._cell_move)
+        add("POST", "/api/isolation/open", self._isolation_open)
+        add("POST", "/api/isolation/recalculate", self._isolation_recalculate)
+        add("POST", "/api/isolation/execute", self._isolation_execute)
+        add("POST", "/api/isolation/resume", self._isolation_resume)
+        add("POST", "/api/isolation/block", self._isolation_block)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -218,6 +239,51 @@ class Api:
             pack_index=_as_int(body, "pack_index", 0),
             rating_v=_as_float(body, "rating_v", 3.35),
             rack_id=body.get("rack_id"),
+            batch_id=body.get("batch_id"),
+        )
+
+    def _trace_cell(self, params: dict, body: dict) -> dict:
+        return self._platform.trace_cell(
+            str(params.get("cell_id", "")), as_of=_as_optional_float(params, "as_of")
+        )
+
+    def _isolation_detail(self, params: dict, body: dict) -> dict:
+        return self._platform.isolation_snapshot(str(params.get("campaign_id", "")))
+
+    def _isolation_replay(self, params: dict, body: dict) -> dict:
+        as_of = _as_optional_float(params, "as_of")
+        if as_of is None:
+            raise StoreError("回放必须给 as_of 时间点", component="console")
+        return self._platform.trace_replay(str(params.get("campaign_id", "")), as_of)
+
+    def _cell_move(self, params: dict, body: dict) -> dict:
+        return self._platform.record_cell_move(
+            str(body.get("cell_id", "")),
+            str(body.get("to_rack_id", "")),
+            batch_id=body.get("batch_id"),
+        )
+
+    def _isolation_open(self, params: dict, body: dict) -> dict:
+        return self._platform.open_isolation(
+            cell_id=body.get("cell_id"),
+            cell_ids=body.get("cell_ids"),
+            caliber=str(body.get("caliber", "batch")),
+        )
+
+    def _isolation_recalculate(self, params: dict, body: dict) -> dict:
+        return self._platform.recalculate_isolation(
+            str(body.get("campaign_id", "")), caliber=body.get("caliber")
+        )
+
+    def _isolation_execute(self, params: dict, body: dict) -> dict:
+        return self._platform.execute_isolation(str(body.get("campaign_id", "")), rack_ids=body.get("rack_ids"))
+
+    def _isolation_resume(self, params: dict, body: dict) -> dict:
+        return self._platform.resume_isolation(str(body.get("campaign_id", "")))
+
+    def _isolation_block(self, params: dict, body: dict) -> dict:
+        return self._platform.block_isolation(
+            str(body.get("rack_id", "")), blocked=bool(body.get("blocked", True))
         )
 
     def _calibrate(self, params: dict, body: dict) -> dict:
