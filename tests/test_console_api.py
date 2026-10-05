@@ -34,7 +34,7 @@ def test_page_library_reports_pages(tmp_path):
     assert library.resolve("/api/status") is None
     assert library.exists() is True
     assert library.render("racks").startswith("<!DOCTYPE html>")
-    assert len(library.index()) == 4
+    assert len(library.index()) == 5
     try:
         library.path_of("bogus")
     except KeyError:
@@ -62,7 +62,7 @@ def test_console_serves_json_and_pages(platform):
         assert entry["kind"] == "power-conversion"
         with urllib.request.urlopen(f"{base_url}/racks", timeout=5) as response:
             html = response.read().decode("utf-8")
-        assert "电池簇状态" in html
+            assert "电池簇状态" in html
     finally:
         server.stop()
 
@@ -102,6 +102,66 @@ def test_console_actions_and_errors(platform):
             assert error.code == 404
         else:  # pragma: no cover - 明确失败路径
             raise AssertionError("未知路由应当返回 404")
+    finally:
+        server.stop()
+
+
+def test_console_lineage_and_quarantine_flow(platform):
+    support.bring_online(platform)
+    server = ConsoleServer(platform, port=0)
+    base_url = server.start()
+    try:
+        code, _ = _post(base_url, "/api/lineage/cell-batch", {"cell_id": "s1", "batch_id": "P1", "ts": 1000})
+        assert code == 200
+        code, _ = _post(base_url, "/api/lineage/cell-batch", {"cell_id": "s2", "batch_id": "P2", "ts": 1000})
+        assert code == 200
+        code, _ = _post(
+            base_url,
+            "/api/lineage/batch-relation",
+            {"batch_id": "P1", "related_batch_id": "P2", "ts": 1000},
+        )
+        assert code == 200
+        code, _ = _post(base_url, "/api/lineage/install", {"cell_id": "s1", "rack_id": "rk-01", "ts": 1000})
+        assert code == 200
+        code, _ = _post(base_url, "/api/lineage/install", {"cell_id": "s2", "rack_id": "rk-02", "ts": 1200})
+        assert code == 200
+
+        code, trace = _get(base_url, "/api/trace/s1")
+        assert code == 200
+        assert trace["batch_ids"] == ["P1", "P2"]
+        assert trace["racks_visited"] == ["rk-01", "rk-02"]
+        code, past = _get(base_url, "/api/trace/s1?as_of=1100")
+        assert code == 200
+        assert [path for path in past["cell_paths"] if path["is_seed"]]
+        code, replay = _get(base_url, "/api/lineage?as_of=1100&kind=install")
+        assert code == 200
+        assert [event["cell_id"] for event in replay["events"]] == ["s1"]
+
+        code, scope = _get(base_url, "/api/quarantine/scope/s1?policy=batch_wide")
+        assert code == 200
+        assert scope["rack_ids"] == ["rk-01", "rk-02"]
+
+        code, order = _post(base_url, "/api/quarantine/open/s1", {"policy": "batch_wide"})
+        assert code == 200
+        assert order["state"] == "completed"
+        oid = order["order_id"]
+        code, fetched = _get(base_url, f"/api/quarantine/{oid}")
+        assert code == 200 and fetched["progress"]["complete"] is True
+        code, listing = _get(base_url, "/api/quarantine")
+        assert code == 200 and len(listing["orders"]) == 1
+        code, recomputed = _post(base_url, f"/api/quarantine/{oid}/recompute", {})
+        assert code == 200 and recomputed["state"] == "completed"
+
+        request = urllib.request.Request(
+            f"{base_url}/api/quarantine/scope/s1?policy=overlap_window",
+            method="GET",
+        )
+        try:
+            urllib.request.urlopen(request, timeout=5)
+        except urllib.error.HTTPError as error:
+            assert error.code == 409
+        else:  # pragma: no cover - 明确失败路径
+            raise AssertionError("窗口口径缺机理依据应返回 409")
     finally:
         server.stop()
 

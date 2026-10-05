@@ -16,11 +16,19 @@ from .balance.balance import Balancer
 from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
-from .errors import StoreError
+from .errors import InterlockError, StoreError
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
 from .ids import IdFactory
+from .lineage.ledger import LineageLedger
+from .lineage.scope import (
+    POLICY_BATCH_WIDE,
+    POLICY_OVERLAP_WINDOW,
+    POLICIES,
+    compute_scope,
+)
+from .lineage.trace import trace_cell
 from .ns.capacity import CapacityPlan, plan_capacity
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
@@ -29,6 +37,8 @@ from .ops.discharge import discharge_rack
 from .ops.suppression import suppress
 from .ops.transfer import transfer_to_grid
 from .pcs.pcs import Pcs
+from .quarantine.board import RackIsolationBoard
+from .quarantine.manager import QuarantineManager
 from .rack.cells import Cell
 from .rack.mapping import RackMapping
 from .rack.pack import Pack
@@ -85,6 +95,7 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self.lineage = LineageLedger(JsonlJournal(store.root, "lineage", segment_limit=512))
         self.namespaces = NamespaceRegistry(station)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
@@ -106,6 +117,13 @@ class Platform:
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
+
+        self.isolation_board = RackIsolationBoard()
+        self.quarantine = QuarantineManager(
+            store,
+            self.isolation_board,
+            publisher=self._publish_quarantine,
+        )
 
         self._cycles = 0
         self._operations = 0
@@ -169,6 +187,12 @@ class Platform:
         if key not in self.racks:
             raise KeyError(f"未知的簇: {key}")
         return self.racks[key]
+
+    def _ensure_rack_not_held(self, rack_id: str) -> None:
+        """隔离联锁：已隔离的簇禁止再充放电与均衡，防止隔离被运行动作绕过。"""
+
+        if self.quarantine.is_rack_held(rack_id):
+            raise InterlockError(f"簇 {rack_id} 已按批次性异常隔离，禁止充放电/均衡", component="quarantine")
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -240,6 +264,211 @@ class Platform:
             )
         )
         return payload
+
+    def _publish_quarantine(self, topic: str, action: str, severity: str, payload: dict) -> None:
+        """隔离管理器的每一步都进审计流水。"""
+
+        self.bus.publish(
+            Event.of(
+                topic,
+                "quarantine",
+                action,
+                station=self.station,
+                severity=severity,
+                message=payload.get("error", {}).get("message", "") if isinstance(payload.get("error"), dict) else "",
+                **payload,
+            )
+        )
+
+    def _require_rack_id(self, rack_id: str) -> None:
+        if rack_id not in self.racks:
+            raise StoreError(f"未知的簇: {rack_id}", component="trace")
+
+    # ---- 单体谱系录入 -------------------------------------------------
+
+    def record_cell_batch(self, cell_id: str, batch_id: str, ts: float | None = None, *, source: str = "") -> dict:
+        """登记某只单体属于某生产批次。"""
+
+        with self._lock:
+            return self.lineage.record_cell_batch(cell_id, batch_id, self.clock.now() if ts is None else ts, source=source)
+
+    def record_batch_relation(
+        self,
+        batch_id: str,
+        related_batch_id: str,
+        ts: float | None = None,
+        *,
+        relation: str = "related",
+        source: str = "",
+    ) -> dict:
+        """登记两个批次间的批次性关联（同炉/同卷绕段/来料合并）。"""
+
+        with self._lock:
+            return self.lineage.record_batch_relation(
+                batch_id,
+                related_batch_id,
+                self.clock.now() if ts is None else ts,
+                relation=relation,
+                source=source,
+            )
+
+    def install_cell(
+        self,
+        cell_id: str,
+        rack_id: str,
+        ts: float | None = None,
+        *,
+        batch_id: str = "",
+        source: str = "",
+    ) -> dict:
+        """登记单体在某时刻装入某簇。"""
+
+        with self._lock:
+            self._require_rack_id(rack_id)
+            return self.lineage.record_install(
+                cell_id, rack_id, self.clock.now() if ts is None else ts, batch_id=batch_id, source=source
+            )
+
+    def remove_cell(self, cell_id: str, rack_id: str, ts: float | None = None, *, source: str = "") -> dict:
+        """登记单体在某时刻从某簇拆除。"""
+
+        with self._lock:
+            self._require_rack_id(rack_id)
+            return self.lineage.record_remove(
+                cell_id, rack_id, self.clock.now() if ts is None else ts, source=source
+            )
+
+    def lineage_replay(self, *, as_of: float | None = None, kind: str | None = None) -> dict:
+        """按时间点回放谱系事件。"""
+
+        with self._lock:
+            return {
+                "as_of": round(self.clock.now() if as_of is None else as_of, 3),
+                "events": self.lineage.replay(as_of=as_of, kind=kind),
+            }
+
+    # ---- 反查与范围计算 -----------------------------------------------
+
+    def trace_cell(self, cell_id: str, *, as_of: float | None = None) -> dict:
+        """从一只异常单体反查批次、批次关联与进过的簇（可按时间点回放）。"""
+
+        with self._lock:
+            return trace_cell(self.lineage.events, cell_id, as_of=as_of)
+
+    def compute_quarantine_scope(
+        self,
+        cell_id: str,
+        *,
+        policy: str = POLICY_BATCH_WIDE,
+        as_of: float | None = None,
+        window_padding_s: float = 0.0,
+        mechanism: str = "",
+    ) -> dict:
+        """按口径计算必须隔离的范围，不落隔离令，供对比两种口径。"""
+
+        if policy not in POLICIES:
+            raise StoreError(f"未知隔离口径: {policy}", component="trace")
+        with self._lock:
+            try:
+                scope = compute_scope(
+                    self.lineage.events,
+                    cell_id,
+                    policy=policy,
+                    as_of=as_of,
+                    window_padding_s=window_padding_s,
+                    mechanism=mechanism,
+                )
+            except ValueError as error:
+                # 域层用 ValueError 表达口径用法错误；控制台边界统一成可返回 409 的平台异常。
+                raise StoreError(str(error), component="trace") from error
+            return scope.as_dict()
+
+    def open_quarantine(
+        self,
+        cell_id: str,
+        *,
+        policy: str = POLICY_BATCH_WIDE,
+        as_of: float | None = None,
+        window_padding_s: float = 0.0,
+        mechanism: str = "",
+    ) -> dict:
+        """从异常单体算范围并立即创建、执行隔离令。"""
+
+        with self._lock:
+            scope = self.compute_quarantine_scope(
+                cell_id,
+                policy=policy,
+                as_of=as_of,
+                window_padding_s=window_padding_s,
+                mechanism=mechanism,
+            )
+            if not scope["batch_ids"]:
+                raise StoreError(f"单体 {cell_id} 没有可追溯的批次归属，无法开隔离令", component="trace")
+            return self.quarantine.open_order(scope, self.clock.now())
+
+    def recompute_quarantine(
+        self,
+        order_id: str,
+        *,
+        policy: str | None = None,
+        as_of: float | None = None,
+        window_padding_s: float | None = None,
+        mechanism: str = "",
+    ) -> dict:
+        """用最新谱系重算隔离令范围（只增不撤），并对新增目标续作。"""
+
+        with self._lock:
+            order = self.quarantine.get(order_id)
+            scope = self.compute_quarantine_scope(
+                order["seed_cell_id"],
+                policy=order["policy"] if policy is None else policy,
+                as_of=order["as_of"] if as_of is None else as_of,
+                window_padding_s=order["window_padding_s"] if window_padding_s is None else window_padding_s,
+                mechanism=mechanism,
+            )
+            return self.quarantine.recompute(order_id, scope, self.clock.now())
+
+    def resume_quarantine(self, order_id: str) -> dict:
+        """续作一张隔离令：只重投未完成目标，已隔离的不动。"""
+
+        with self._lock:
+            return self.quarantine.resume(order_id, self.clock.now())
+
+    def resume_all_quarantine(self) -> dict:
+        """把所有中途失败/未完成的隔离令续作一遍。"""
+
+        with self._lock:
+            return self.quarantine.resume_all(self.clock.now())
+
+    def quarantine_orders(self) -> dict:
+        """返回全部隔离令与执行板物理状态。"""
+
+        with self._lock:
+            return {"orders": self.quarantine.orders(), "board": self.quarantine.board_snapshot()}
+
+    def quarantine_order(self, order_id: str) -> dict:
+        """取一张隔离令的执行状态。"""
+
+        with self._lock:
+            return self.quarantine.get(order_id)
+
+    def arm_quarantine_failure(self, *, rack_id: str = "", batch_id: str = "") -> dict:
+        """给下一次下发注入一次失败（演练/自检用）。"""
+
+        with self._lock:
+            return self.quarantine.fail_once(rack_id=rack_id, batch_id=batch_id)
+
+    def quarantine_snapshot(self) -> dict:
+        """隔离域快照：谱系计数、隔离令、已隔离簇与停用批次。"""
+
+        with self._lock:
+            return {
+                "lineage_events": self.lineage.count(),
+                "orders": self.quarantine.orders(),
+                "board": self.quarantine.board_snapshot(),
+                "held_racks": self.quarantine.held_racks(),
+                "frozen_batches": self.quarantine.frozen_batches(),
+            }
 
     def start(self) -> dict:
         """启动平台：核对拓扑与命名空间。"""
@@ -320,12 +549,13 @@ class Platform:
             summary = self._record_operation(op_id, "off_grid", {"ok": not violations, "steps": steps, "violations": violations})
             return {"station": self.station, "ok": not violations, "steps": steps, "violations": violations, **summary}
 
-    def discharge(self, power_kw: float = 200.0, dt: float = 60.0) -> dict:
-        """放电编排：并网限额钳位 → 爬坡 → 电量累计 → 配额记账。"""
+    def discharge(self, power_kw: float = 200.0, dt: float = 60.0, rack_id: str | None = None) -> dict:
+        """放电编排：隔离联锁 → 并网限额钳位 → 爬坡 → 电量累计 → 配额记账。"""
 
         with self._lock:
+            self._ensure_rack_not_held(rack_id or DEFAULT_RACK)
             op_id = self.ids.next()
-            rack = self._rack(DEFAULT_RACK)
+            rack = self._rack(rack_id)
             report = discharge_rack(
                 self.pcs,
                 self.grid,
@@ -344,6 +574,7 @@ class Platform:
         """充电编排：均衡核对 → 温控降额 → 电压核对 → 电流阶梯 → 配额记账。"""
 
         with self._lock:
+            self._ensure_rack_not_held(rack_id or DEFAULT_RACK)
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             report = charge_rack(
@@ -367,6 +598,7 @@ class Platform:
         """跑一次均衡直到压差回到目标带内或超时中止。"""
 
         with self._lock:
+            self._ensure_rack_not_held(rack_id or DEFAULT_RACK)
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             started = self.balancer.start(rack.cells())
@@ -777,6 +1009,7 @@ class Platform:
             "capacity": self.capacity().as_dict(),
             "quota": self.quota_snapshot(),
             "audit": self.audit_snapshot(),
+            "quarantine": self.quarantine_snapshot(),
             "mapping": self.rack_mapping(),
             "config": config_to_mapping(self.config),
         }

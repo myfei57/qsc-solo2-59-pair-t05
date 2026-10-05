@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>批次隔离追溯</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; margin: 24px; color: #1c2430; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #d6dde6; padding: 6px 10px; text-align: left; }
+    th { background: #eef3f9; }
+    .completed { color: #15803d; font-weight: 600; }
+    .partial, .executing { color: #b45309; font-weight: 600; }
+    .isolated { color: #b91c1c; font-weight: 600; }
+    .failed { color: #b91c1c; }
+    .pending { color: #6b7280; }
+    button { padding: 6px 12px; margin-right: 8px; }
+    input, select { padding: 4px; }
+    #result { white-space: pre-wrap; background: #f6f8fa; padding: 10px; margin-top: 12px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>批次隔离追溯</h1>
+  <p id="summary">读取中…</p>
+
+  <h2>从异常单体反查并开隔离令</h2>
+  <p>
+    单体 <input id="cell_id" size="14" placeholder="如 s1">
+    口径
+    <select id="policy">
+      <option value="batch_wide">保守（相关批次全圈）</option>
+      <option value="overlap_window">时间窗口收敛</option>
+    </select>
+    <input id="mechanism" size="20" placeholder="时间窗口口径必填机理依据">
+    <button onclick="previewScope()">只算范围</button>
+    <button onclick="openOrder()">开隔离令</button>
+  </p>
+  <p class="partial">保守口径安全但停产面大；时间窗口口径停产面小，仅在异常依赖同簇共存机理时使用。</p>
+
+  <table>
+    <thead>
+      <tr><th>隔离令</th><th>异常单体</th><th>口径</th><th>状态</th><th>完成/总数</th><th>失败</th><th>操作</th></tr>
+    </thead>
+    <tbody id="orders"></tbody>
+  </table>
+
+  <h2>执行板物理态</h2>
+  <p id="board">读取中…</p>
+  <pre id="result"></pre>
+
+  <script>
+    async function api(path, options) {
+      const response = await fetch(path, options);
+      const payload = await response.json();
+      document.getElementById("result").textContent = JSON.stringify(payload, null, 2);
+      if (!response.ok) throw new Error(payload.message || response.status);
+      return payload;
+    }
+    async function load() {
+      const data = await (await fetch("/api/quarantine")).json();
+      const rows = document.getElementById("rows");
+      const tbody = document.getElementById("orders");
+      tbody.innerHTML = "";
+      for (const order of data.orders) {
+        const tr = document.createElement("tr");
+        const resume = order.progress.complete ? "" :
+          `<button onclick="resume('${order.order_id}')">续作</button>`;
+        tr.innerHTML = `<td>${order.order_id}</td><td>${order.seed_cell_id}</td>` +
+          `<td>${order.policy}</td><td class="${order.state}">${order.state}</td>` +
+          `<td>${order.progress.isolated}/${order.progress.total}</td>` +
+          `<td class="${order.progress.failed ? 'failed' : ''}">${order.progress.failed}</td>` +
+          `<td>${resume} <button onclick="recompute('${order.order_id}')">重算</button></td>`;
+        tbody.appendChild(tr);
+      }
+      document.getElementById("board").innerHTML =
+        `已隔离簇：<span class="isolated">${(data.board.isolated_racks || []).join(", ") || "无"}</span>` +
+        `｜停用批次：${(data.board.frozen_batches || []).join(", ") || "无"}` +
+        `｜累计下发 ${data.board.attempts} 次`;
+    }
+    async function previewScope() {
+      const policy = document.getElementById("policy").value;
+      const mechanism = document.getElementById("mechanism").value;
+      const cell = document.getElementById("cell_id").value.trim();
+      const qs = new URLSearchParams({ policy });
+      if (mechanism) qs.set("mechanism", mechanism);
+      await api(`/api/quarantine/scope/${encodeURIComponent(cell)}?${qs}`);
+    }
+    async function openOrder() {
+      const body = {
+        policy: document.getElementById("policy").value,
+        mechanism: document.getElementById("mechanism").value,
+      };
+      await api(`/api/quarantine/open/${encodeURIComponent(document.getElementById("cell_id").value.trim())}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      load();
+    }
+    async function resume(orderId) {
+      await api(`/api/quarantine/${orderId}/resume`, { method: "POST" });
+      load();
+    }
+    async function recompute(orderId) {
+      await api(`/api/quarantine/${orderId}/recompute`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      load();
+    }
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>

@@ -26,5 +26,7 @@ packages = [
     "batterystore.balance",
     "batterystore.quota",
     "batterystore.ops",
+    "batterystore.lineage",
+    "batterystore.quarantine",
     "batterystore.console",
 ]

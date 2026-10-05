@@ -1,8 +1,8 @@
 """控制台页面服务。
 
-四个页面（簇状态、PCS、功率、告警）由独立 HTML 文件提供，页面只读取 JSON
-接口，不在服务端拼字符串。:meth:`PageLibrary.exists` 供启动自检核对页面是否
-齐全，缺页面时启动报告里能直接看出来。
+五个页面（簇状态、PCS、功率、告警、批次隔离追溯）由独立 HTML 文件提供，页面只
+读取 JSON 接口，不在服务端拼字符串。:meth:`PageLibrary.exists` 供启动自检
+核对页面是否齐全，缺页面时启动报告里能直接看出来。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ PAGES = {
     "pcs": "pcs.html",
     "power": "power.html",
     "alarms": "alarms.html",
+    "quarantine": "quarantine.html",
 }
 
 

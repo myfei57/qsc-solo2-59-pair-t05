@@ -8,6 +8,8 @@
 ``status``   打印当前状态快照；
 ``config``   打印生效配置；
 ``alerts``   打印按最新编号路由后的告警；
+``lineage``  录入/回放单体谱系（批次归属、批次关联、装机、拆除、反查）；
+``quarantine`` 计算隔离范围、开隔离令、续作、重算与状态查询；
 ``reset``    清掉落盘的平台计数。
 """
 
@@ -165,6 +167,64 @@ def _cmd_alerts(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_lineage(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    ts = getattr(args, "ts", None)
+    if args.lineage_action == "batch":
+        payload = platform.record_cell_batch(args.cell_id, args.batch_id, ts, source=args.source)
+    elif args.lineage_action == "relate":
+        payload = platform.record_batch_relation(
+            args.batch_id, args.related_batch_id, ts, relation=args.relation, source=args.source
+        )
+    elif args.lineage_action == "install":
+        payload = platform.install_cell(args.cell_id, args.rack_id, ts, batch_id=args.batch_id, source=args.source)
+    elif args.lineage_action == "remove":
+        payload = platform.remove_cell(args.cell_id, args.rack_id, ts, source=args.source)
+    elif args.lineage_action == "replay":
+        payload = platform.lineage_replay(as_of=ts, kind=args.kind)
+    else:
+        payload = platform.trace_cell(args.cell_id, as_of=ts)
+    _dump(payload)
+    return 0
+
+
+def _cmd_quarantine(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    if args.quarantine_action == "scope":
+        payload = platform.compute_quarantine_scope(
+            args.cell_id,
+            policy=args.policy,
+            window_padding_s=args.window_padding_s,
+            mechanism=args.mechanism,
+        )
+    elif args.quarantine_action == "open":
+        payload = platform.open_quarantine(
+            args.cell_id,
+            policy=args.policy,
+            window_padding_s=args.window_padding_s,
+            mechanism=args.mechanism,
+        )
+    elif args.quarantine_action == "get":
+        payload = platform.quarantine_order(args.order_id)
+    elif args.quarantine_action == "resume":
+        payload = (
+            platform.resume_all_quarantine() if args.order_id == "all" else platform.resume_quarantine(args.order_id)
+        )
+    elif args.quarantine_action == "recompute":
+        payload = platform.recompute_quarantine(
+            args.order_id,
+            policy=args.policy if args.policy_set else None,
+            window_padding_s=args.window_padding_s if args.window_set else None,
+            mechanism=args.mechanism,
+        )
+    elif args.quarantine_action == "fail-once":
+        payload = platform.arm_quarantine_failure(rack_id=args.rack_id, batch_id=args.batch_id)
+    else:
+        payload = platform.quarantine_orders()
+    _dump(payload)
+    return 0
+
+
 def _cmd_reset(args: argparse.Namespace) -> int:
     platform = _build(args)
     _dump(platform.reset_state())
@@ -209,6 +269,78 @@ def build_parser() -> argparse.ArgumentParser:
 
     alerts = sub.add_parser("alerts", help="打印路由后的告警", parents=[common])
     alerts.set_defaults(func=_cmd_alerts)
+
+    lineage = sub.add_parser("lineage", help="单体谱系录入、回放与反查", parents=[common])
+    lineage_sub = lineage.add_subparsers(dest="lineage_action", required=True)
+    lineage_batch = lineage_sub.add_parser("batch", help="登记单体批次归属", parents=[common])
+    lineage_batch.add_argument("--cell-id", required=True)
+    lineage_batch.add_argument("--batch-id", required=True)
+    lineage_batch.add_argument("--ts", type=float, default=None, help="业务时间戳，缺省取当前")
+    lineage_batch.add_argument("--source", default="cli")
+    lineage_batch.set_defaults(func=_cmd_lineage)
+    lineage_relate = lineage_sub.add_parser("relate", help="登记批次关联", parents=[common])
+    lineage_relate.add_argument("--batch-id", required=True)
+    lineage_relate.add_argument("--related-batch-id", required=True)
+    lineage_relate.add_argument("--relation", default="related")
+    lineage_relate.add_argument("--ts", type=float, default=None)
+    lineage_relate.add_argument("--source", default="cli")
+    lineage_relate.set_defaults(func=_cmd_lineage)
+    lineage_install = lineage_sub.add_parser("install", help="登记单体装入簇", parents=[common])
+    lineage_install.add_argument("--cell-id", required=True)
+    lineage_install.add_argument("--rack-id", required=True)
+    lineage_install.add_argument("--batch-id", default="")
+    lineage_install.add_argument("--ts", type=float, default=None)
+    lineage_install.add_argument("--source", default="cli")
+    lineage_install.set_defaults(func=_cmd_lineage)
+    lineage_remove = lineage_sub.add_parser("remove", help="登记单体从簇拆除", parents=[common])
+    lineage_remove.add_argument("--cell-id", required=True)
+    lineage_remove.add_argument("--rack-id", required=True)
+    lineage_remove.add_argument("--ts", type=float, default=None)
+    lineage_remove.add_argument("--source", default="cli")
+    lineage_remove.set_defaults(func=_cmd_lineage)
+    lineage_replay = lineage_sub.add_parser("replay", help="按时间点回放谱系事件", parents=[common])
+    lineage_replay.add_argument("--ts", type=float, default=None, help="截止时点")
+    lineage_replay.add_argument("--kind", default=None, choices=("cell_batch", "batch_relation", "install", "remove"))
+    lineage_replay.set_defaults(func=_cmd_lineage)
+    lineage_trace = lineage_sub.add_parser("trace", help="从异常单体反查批次与簇", parents=[common])
+    lineage_trace.add_argument("--cell-id", required=True)
+    lineage_trace.add_argument("--ts", type=float, default=None, help="截止时点回放")
+    lineage_trace.set_defaults(func=_cmd_lineage)
+
+    quarantine = sub.add_parser("quarantine", help="隔离范围计算与隔离令", parents=[common])
+    quarantine_sub = quarantine.add_subparsers(dest="quarantine_action", required=True)
+    q_scope = quarantine_sub.add_parser("scope", help="只算范围不落令，对比两种口径", parents=[common])
+    q_scope.add_argument("--cell-id", required=True)
+    q_scope.add_argument("--policy", choices=("batch_wide", "overlap_window"), default="batch_wide")
+    q_scope.add_argument("--window-padding-s", type=float, default=0.0)
+    q_scope.add_argument("--mechanism", default="", help="时间窗口口径必填的机理依据")
+    q_scope.set_defaults(func=_cmd_quarantine)
+    q_open = quarantine_sub.add_parser("open", help="算范围并创建、执行隔离令", parents=[common])
+    q_open.add_argument("--cell-id", required=True)
+    q_open.add_argument("--policy", choices=("batch_wide", "overlap_window"), default="batch_wide")
+    q_open.add_argument("--window-padding-s", type=float, default=0.0)
+    q_open.add_argument("--mechanism", default="")
+    q_open.set_defaults(func=_cmd_quarantine)
+    q_list = quarantine_sub.add_parser("list", help="列出全部隔离令", parents=[common])
+    q_list.set_defaults(func=_cmd_quarantine)
+    q_get = quarantine_sub.add_parser("get", help="查一张隔离令", parents=[common])
+    q_get.add_argument("--order-id", required=True)
+    q_get.set_defaults(func=_cmd_quarantine)
+    q_resume = quarantine_sub.add_parser("resume", help="续作隔离令（all 续作全部）", parents=[common])
+    q_resume.add_argument("--order-id", required=True)
+    q_resume.set_defaults(func=_cmd_quarantine)
+    q_recompute = quarantine_sub.add_parser("recompute", help="按最新谱系重算范围（只增不撤）", parents=[common])
+    q_recompute.add_argument("--order-id", required=True)
+    q_recompute.add_argument("--policy", choices=("batch_wide", "overlap_window"), default="batch_wide")
+    q_recompute.add_argument("--window-padding-s", type=float, default=0.0)
+    q_recompute.add_argument("--mechanism", default="")
+    q_recompute.set_defaults(
+        func=_cmd_quarantine, policy_set=True, window_set=True
+    )
+    q_fail = quarantine_sub.add_parser("fail-once", help="注入一次下发失败（演练）", parents=[common])
+    q_fail.add_argument("--rack-id", default="")
+    q_fail.add_argument("--batch-id", default="")
+    q_fail.set_defaults(func=_cmd_quarantine)
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)

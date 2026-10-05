@@ -70,6 +70,11 @@ class Api:
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
         add("GET", "/api/audit/operations", self._operations)
+        add("GET", "/api/lineage", self._lineage_replay)
+        add("GET", "/api/trace/{cell_id}", self._trace)
+        add("GET", "/api/quarantine/scope/{cell_id}", self._scope_preview)
+        add("GET", "/api/quarantine", lambda params, body: self._platform.quarantine_orders())
+        add("GET", "/api/quarantine/{order_id}", self._quarantine_order)
         add("GET", "/api/alarms", lambda params, body: {"alarms": self._platform.audit.alarms()})
         add("GET", "/api/alerts", lambda params, body: {"alerts": self._platform.alerts()})
         add("GET", "/api/events", self._events)
@@ -100,6 +105,15 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("POST", "/api/lineage/cell-batch", self._lineage_cell_batch)
+        add("POST", "/api/lineage/batch-relation", self._lineage_batch_relation)
+        add("POST", "/api/lineage/install", self._lineage_install)
+        add("POST", "/api/lineage/remove", self._lineage_remove)
+        add("POST", "/api/quarantine/open/{cell_id}", self._quarantine_open)
+        add("POST", "/api/quarantine/{order_id}/recompute", self._quarantine_recompute)
+        add("POST", "/api/quarantine/{order_id}/resume", self._quarantine_resume)
+        add("POST", "/api/quarantine/resume-all", lambda params, body: self._platform.resume_all_quarantine())
+        add("POST", "/api/quarantine/fail-once", self._quarantine_fail_once)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +275,97 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _as_of(self, container: dict):
+        if "as_of" not in container or container.get("as_of") in (None, ""):
+            return None
+        return _as_float(container, "as_of", 0.0)
+
+    def _ts(self, container: dict):
+        """录入事件的业务时间：优先 ``ts``，兼容 ``as_of``，缺省由平台取当前时钟。"""
+
+        for key in ("ts", "as_of"):
+            if key in container and container.get(key) not in (None, ""):
+                return _as_float(container, key, 0.0)
+        return None
+
+    def _lineage_replay(self, params: dict, body: dict) -> dict:
+        as_of = self._as_of(params)
+        return self._platform.lineage_replay(as_of=as_of, kind=params.get("kind") or None)
+
+    def _lineage_cell_batch(self, params: dict, body: dict) -> dict:
+        return self._platform.record_cell_batch(
+            str(body["cell_id"]),
+            str(body["batch_id"]),
+            self._ts(body),
+            source=str(body.get("source", "console")),
+        )
+
+    def _lineage_batch_relation(self, params: dict, body: dict) -> dict:
+        return self._platform.record_batch_relation(
+            str(body["batch_id"]),
+            str(body["related_batch_id"]),
+            self._ts(body),
+            relation=str(body.get("relation", "related")),
+            source=str(body.get("source", "console")),
+        )
+
+    def _lineage_install(self, params: dict, body: dict) -> dict:
+        return self._platform.install_cell(
+            str(body["cell_id"]),
+            str(body["rack_id"]),
+            self._ts(body),
+            batch_id=str(body.get("batch_id", "")),
+            source=str(body.get("source", "console")),
+        )
+
+    def _lineage_remove(self, params: dict, body: dict) -> dict:
+        return self._platform.remove_cell(
+            str(body["cell_id"]),
+            str(body["rack_id"]),
+            self._ts(body),
+            source=str(body.get("source", "console")),
+        )
+
+    def _trace(self, params: dict, body: dict) -> dict:
+        return self._platform.trace_cell(str(params["cell_id"]), as_of=self._as_of(params))
+
+    def _scope_preview(self, params: dict, body: dict) -> dict:
+        merged = {**body, **params}
+        return self._platform.compute_quarantine_scope(
+            str(params["cell_id"]),
+            policy=str(merged.get("policy", "batch_wide")),
+            as_of=self._as_of(merged),
+            window_padding_s=_as_float(merged, "window_padding_s", 0.0),
+            mechanism=str(merged.get("mechanism", "")),
+        )
+
+    def _quarantine_order(self, params: dict, body: dict) -> dict:
+        return self._platform.quarantine_order(str(params["order_id"]))
+
+    def _quarantine_open(self, params: dict, body: dict) -> dict:
+        return self._platform.open_quarantine(
+            str(params["cell_id"]),
+            policy=str(body.get("policy", "batch_wide")),
+            as_of=self._as_of(body),
+            window_padding_s=_as_float(body, "window_padding_s", 0.0),
+            mechanism=str(body.get("mechanism", "")),
+        )
+
+    def _quarantine_recompute(self, params: dict, body: dict) -> dict:
+        return self._platform.recompute_quarantine(
+            str(params["order_id"]),
+            policy=body.get("policy"),
+            as_of=self._as_of(body),
+            window_padding_s=_as_float(body, "window_padding_s", 0.0) if "window_padding_s" in body else None,
+            mechanism=str(body.get("mechanism", "")),
+        )
+
+    def _quarantine_resume(self, params: dict, body: dict) -> dict:
+        return self._platform.resume_quarantine(str(params["order_id"]))
+
+    def _quarantine_fail_once(self, params: dict, body: dict) -> dict:
+        return self._platform.arm_quarantine_failure(
+            rack_id=str(body.get("rack_id", "")),
+            batch_id=str(body.get("batch_id", "")),
+        )
